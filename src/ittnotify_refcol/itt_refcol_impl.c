@@ -11,6 +11,26 @@
 
 #define LOG_BUFFER_MAX_SIZE 256
 
+#define ITT_MUTEX_INIT_AND_LOCK(p) {                                 \
+    if (PTHREAD_SYMBOLS)                                             \
+    {                                                                \
+        if (!p->mutex_initialized)                                    \
+        {                                                            \
+            if (__itt_interlocked_compare_exchange(&p->atomic_counter, 1, 0) == 0) \
+            {                                                        \
+                __itt_mutex_init(&p->mutex);                          \
+                p->mutex_initialized = 1;                             \
+            }                                                        \
+            else                                                     \
+                while (!p->mutex_initialized)                         \
+                    __itt_thread_yield();                            \
+        }                                                            \
+        __itt_mutex_lock(&p->mutex);                                  \
+    }                                                                \
+}
+
+
+
 static const char* env_log_dir = "INTEL_LIBITTNOTIFY_LOG_DIR";
 static const char* log_level_str[] = {"INFO", "WARN", "ERROR", "FATAL_ERROR"};
 
@@ -30,13 +50,27 @@ char* log_file_name_generate()
 {
     time_t time_now = time(NULL);
     struct tm* time_info = localtime(&time_now);
-    char* log_file_name = malloc(sizeof(char) * (LOG_BUFFER_MAX_SIZE/2));
+    char* log_file_name = (char*)malloc(sizeof(char) * (LOG_BUFFER_MAX_SIZE/2));
 
     sprintf(log_file_name,"libittnotify_refcol_%d%d%d%d%d%d.log",
             time_info->tm_year+1900, time_info->tm_mon+1, time_info->tm_mday,
             time_info->tm_hour, time_info->tm_min, time_info->tm_sec);
 
     return log_file_name;
+}
+
+static __itt_global * itt_global_ptr = NULL;
+
+static void __itt_report_error(int code, ...)
+{
+    va_list args;
+    va_start(args, code);
+    if (itt_global_ptr->error_handler != NULL)
+    {
+        __itt_error_handler_t* handler = (__itt_error_handler_t*)(size_t)itt_global_ptr->error_handler;
+        handler((__itt_error_code)code, args);
+    }
+    va_end(args);
 }
 
 void ref_col_init()
@@ -95,6 +129,8 @@ ITT_EXTERN_C void ITTAPI __itt_api_init(__itt_global* p, __itt_group_id init_gro
         (void)init_groups;
         fill_func_ptr_per_lib(p);
         ref_col_init();
+        itt_global_ptr = p;
+        fprintf(stderr, "__itt_api_init\n");
     }
     else
     {
@@ -144,7 +180,7 @@ void log_func_call(uint8_t log_level, const char* function_name, const char* mes
 /* Please remember to call free() after using get_metadata_elements() */
 char* get_metadata_elements(size_t size, __itt_metadata_type type, void* metadata)
 {
-    char* metadata_str = malloc(sizeof(char) * LOG_BUFFER_MAX_SIZE);
+    char* metadata_str = (char*)malloc(sizeof(char) * LOG_BUFFER_MAX_SIZE);
     *metadata_str = '\0';
     uint16_t offset = 0;
 
@@ -193,7 +229,7 @@ char* get_metadata_elements(size_t size, __itt_metadata_type type, void* metadat
 /* Please remember to call free() after using get_context_metadata_element() */
 char* get_context_metadata_element(__itt_context_type type, void* metadata)
 {
-    char* metadata_str = malloc(sizeof(char) * LOG_BUFFER_MAX_SIZE/4);
+    char* metadata_str = (char*)malloc(sizeof(char) * LOG_BUFFER_MAX_SIZE/4);
     *metadata_str = '\0';
 
     switch(type)
@@ -222,6 +258,91 @@ char* get_context_metadata_element(__itt_context_type type, void* metadata)
 
     return metadata_str;
 }
+
+ITT_EXTERN_C __itt_string_handle * ITTAPI __itt_string_handle_create(const char *name) 
+{
+    if(name == NULL) {
+        return NULL;
+    }
+
+    __itt_string_handle * head = itt_global_ptr->string_list;
+    __itt_string_handle * tail = NULL;
+    __itt_string_handle * result = NULL;
+    
+    if(PTHREAD_SYMBOLS) {
+        ITT_MUTEX_INIT_AND_LOCK(itt_global_ptr);
+    }
+
+    // Search for existing
+    
+    for(__itt_string_handle * cur = head; cur != NULL; cur = cur->next) {
+        tail = cur;
+        if(cur->strA != NULL && !__itt_fstrcmp(cur->strA, name)) {
+            result = cur;
+            fprintf(stderr, "Found string handle %s\n", result->strA);
+            break;
+        }
+    }
+
+    // Create if not existing
+
+    if(result == NULL) {
+        NEW_STRING_HANDLE_A(itt_global_ptr, result, tail, name);
+        fprintf(stderr, "Placed new string handle %s after %s\n", name, tail->strA);
+    }
+
+    LOG_FUNC_CALL_INFO("function args: name=%s", name);
+
+    if(PTHREAD_SYMBOLS) {
+        __itt_mutex_unlock(&itt_global_ptr->mutex);
+    }
+
+    fprintf(stderr, "Returning string handle %p for %s\n", result, name);
+    return result;
+}
+
+ITT_EXTERN_C __itt_domain * ITTAPI __itt_domain_create(const char * name) {
+
+    if(name == NULL) {
+        return NULL;
+    }
+
+    __itt_domain * head = itt_global_ptr->domain_list;
+    __itt_domain * tail = NULL;
+    __itt_domain * result = NULL;
+
+    if(PTHREAD_SYMBOLS) {
+        ITT_MUTEX_INIT_AND_LOCK(itt_global_ptr);
+    }
+
+    // Search for existing
+    
+    for(__itt_domain * cur = head; cur != NULL; cur = cur->next) {
+        tail = cur;
+        if(cur->nameA != NULL && !__itt_fstrcmp(cur->nameA, name)) {
+            result = cur;
+            fprintf(stderr, "Found domain %s\n", result->nameA);
+            break;
+        }
+    }
+
+    // Create if not existing
+
+    if(result == NULL) {
+        NEW_DOMAIN_A(itt_global_ptr, result, tail, name);
+        fprintf(stderr, "Placed new domain %s after %s\n", name, tail->nameA);
+    }
+
+    LOG_FUNC_CALL_INFO("function args: name=%s", name);
+
+    if(PTHREAD_SYMBOLS) {
+        __itt_mutex_unlock(&itt_global_ptr->mutex);
+    }
+
+    fprintf(stderr, "Returning domain %p for %s\n", result, name);
+    return result;
+}
+
 
 ITT_EXTERN_C void ITTAPI __itt_pause(void)
 {
